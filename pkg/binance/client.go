@@ -1,7 +1,6 @@
 package binance
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -53,7 +52,15 @@ func (c *Client) VerifyAPI() error {
 
 // GetAccount gets account info
 func (c *Client) GetAccount() (map[string]interface{}, error) {
-	return c.signedRequest("GET", "/fapi/v2/account", nil)
+	resp, err := c.signedRequest("GET", "/fapi/v2/account", nil)
+	if err != nil {
+		return nil, err
+	}
+	account, ok := resp.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response type")
+	}
+	return account, nil
 }
 
 // CreateLimitOrder creates a limit order
@@ -74,7 +81,15 @@ func (c *Client) CreateLimitOrder(symbol, side string, price, quantity float64) 
 		"quantity", quantity,
 	)
 	
-	return c.signedRequest("POST", "/fapi/v1/order", params)
+	resp, err := c.signedRequest("POST", "/fapi/v1/order", params)
+	if err != nil {
+		return nil, err
+	}
+	order, ok := resp.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response type")
+	}
+	return order, nil
 }
 
 // CancelOrder cancels an order
