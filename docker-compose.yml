@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  hypefollow:
+    build: .
+    container_name: hypefollow-go
+    restart: unless-stopped
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - HYPERLIQUID_USER=${HYPERLIQUID_USER:-0xdae4df7207feb3b350e4284c8efe5f7dac37f637}
+      - FOLLOW_RATIO=${FOLLOW_RATIO:-0.1}
+      - MIN_ORDER_SIZE=${MIN_ORDER_SIZE:-0.002}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
