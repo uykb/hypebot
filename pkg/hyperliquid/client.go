@@ -3,8 +3,6 @@ package hyperliquid
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -31,8 +29,6 @@ type Client struct {
 	mapMutex        sync.RWMutex
 	processingMap   map[string]bool  // HL oid -> is processing
 	processingMutex sync.RWMutex
-	lastChecksum    string
-	checksumMutex   sync.RWMutex
 	reconnecting    bool
 	reconnectMutex  sync.Mutex
 	syncing         bool
@@ -564,7 +560,7 @@ func (c *Client) startChecksumValidation(ctx context.Context) {
 	}
 }
 
-// validateChecksum compares HL and Binance order states
+// validateChecksum compares HL and Binance order counts and triggers sync if needed
 func (c *Client) validateChecksum() {
 	// Skip if sync is already in progress
 	c.syncMutex.Lock()
@@ -582,8 +578,13 @@ func (c *Client) validateChecksum() {
 		return
 	}
 
-	// Calculate HL checksum (only BTC orders)
-	hlChecksum := c.calculateOrdersChecksum(hlOrders)
+	// Count BTC orders
+	hlCount := 0
+	for _, order := range hlOrders {
+		if order.Coin == "BTC" {
+			hlCount++
+		}
+	}
 
 	// Get Binance open orders
 	binanceOrders, err := c.binanceClient.GetOpenOrders("BTCUSDT")
@@ -592,33 +593,26 @@ func (c *Client) validateChecksum() {
 		return
 	}
 
-	// Calculate Binance checksum
-	binanceChecksum := c.calculateBinanceOrdersChecksum(binanceOrders)
-
-	// Compare checksums
-	c.checksumMutex.RLock()
-	lastChecksum := c.lastChecksum
-	c.checksumMutex.RUnlock()
-
-	if hlChecksum != binanceChecksum {
-		logger.Warn("Checksum mismatch detected, triggering sync",
-			"hl_checksum", hlChecksum,
-			"binance_checksum", binanceChecksum,
-			"hl_count", len(hlOrders),
-			"binance_count", len(binanceOrders),
-		)
-		c.syncOpenOrders()
-	} else if hlChecksum != lastChecksum {
-		logger.Info("Checksum validated (state changed)",
-			"checksum", hlChecksum,
-			"hl_count", len(hlOrders),
-			"binance_count", len(binanceOrders),
-		)
+	// Count LIMIT orders
+	binanceCount := 0
+	for _, order := range binanceOrders {
+		if orderType, _ := order["type"].(string); orderType == "LIMIT" {
+			binanceCount++
+		}
 	}
 
-	c.checksumMutex.Lock()
-	c.lastChecksum = hlChecksum
-	c.checksumMutex.Unlock()
+	// Compare counts
+	if hlCount != binanceCount {
+		logger.Warn("Order count mismatch detected, triggering sync",
+			"hl_count", hlCount,
+			"binance_count", binanceCount,
+		)
+		c.syncOpenOrders()
+	} else {
+		logger.Info("Order count validated",
+			"count", hlCount,
+		)
+	}
 }
 
 // fetchHLOrders fetches open orders from Hyperliquid
@@ -642,81 +636,4 @@ func (c *Client) fetchHLOrders() ([]HLOrder, error) {
 	}
 
 	return orders, nil
-}
-
-// calculateOrdersChecksum calculates SHA256 hash of HL orders
-func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
-	// Filter BTC orders only (openOrders API returns only open orders)
-	var btcOrders []HLOrder
-	for _, order := range orders {
-		if order.Coin == "BTC" {
-			btcOrders = append(btcOrders, order)
-		}
-	}
-
-	// Sort by OID for consistent ordering
-	sort.Slice(btcOrders, func(i, j int) bool {
-		return btcOrders[i].OID < btcOrders[j].OID
-	})
-
-	// Build string representation using consistent formatting
-	// Round to 8 decimal places to match Binance precision
-	var data string
-	for _, order := range btcOrders {
-		price := strconv.FormatFloat(order.LimitPx, 'f', 8, 64)
-		size := strconv.FormatFloat(order.Size, 'f', 8, 64)
-		data += fmt.Sprintf("%d|%s|%s|%s|%s|", order.OID, order.Coin, order.Side, price, size)
-	}
-
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])
-}
-
-// calculateBinanceOrdersChecksum calculates SHA256 hash of Binance orders
-func (c *Client) calculateBinanceOrdersChecksum(orders []map[string]interface{}) string {
-	// Filter and collect LIMIT orders
-	type orderKey struct {
-		id    int64
-		side  string
-		price string
-		qty   string
-	}
-	var limitOrders []orderKey
-
-	for _, order := range orders {
-		orderType, _ := order["type"].(string)
-		if orderType != "LIMIT" {
-			continue
-		}
-
-		orderID, ok := order["orderId"].(float64)
-		if !ok {
-			continue
-		}
-
-		side, _ := order["side"].(string)
-		price, _ := order["price"].(string)
-		qty, _ := order["origQty"].(string)
-
-		limitOrders = append(limitOrders, orderKey{
-			id:    int64(orderID),
-			side:  side,
-			price: price,
-			qty:   qty,
-		})
-	}
-
-	// Sort by ID for consistent ordering
-	sort.Slice(limitOrders, func(i, j int) bool {
-		return limitOrders[i].id < limitOrders[j].id
-	})
-
-	// Build string representation (use BTC as symbol for consistency with HL)
-	var data string
-	for _, order := range limitOrders {
-		data += fmt.Sprintf("%d|BTC|%s|%s|%s|", order.id, order.side, order.price, order.qty)
-	}
-
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])
 }
