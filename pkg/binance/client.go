@@ -112,16 +112,11 @@ func (c *Client) GetOpenOrders(symbol string) ([]map[string]interface{}, error) 
 
 	resp, err := c.signedRequest("GET", "/fapi/v1/openOrders", params)
 	if err != nil {
-		logger.Error("GetOpenOrders API error", err, "symbol", symbol)
 		return nil, err
 	}
 
-	// Log raw response for debugging
-	logger.Info("GetOpenOrders raw response", "type", fmt.Sprintf("%T"), resp)
-
 	orders, ok := resp.([]interface{})
 	if !ok {
-		logger.Warn("GetOpenOrders: unexpected response type", "type", fmt.Sprintf("%T"), resp)
 		return []map[string]interface{}{}, nil
 	}
 
