@@ -3,15 +3,18 @@ package hyperliquid
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	
+
 	"hypefollow/pkg/binance"
 	"hypefollow/pkg/config"
 	"hypefollow/pkg/logger"
@@ -25,8 +28,10 @@ type Client struct {
 	connMutex       sync.RWMutex
 	orderMap        map[string]int64 // HL oid -> Binance orderId
 	mapMutex        sync.RWMutex
-	processingMap   map[string]bool // HL oid -> is processing
+	processingMap   map[string]bool  // HL oid -> is processing
 	processingMutex sync.RWMutex
+	lastChecksum    string
+	checksumMutex   sync.RWMutex
 }
 
 // NewClient creates a new Hyperliquid client
@@ -67,10 +72,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	
 	// Initial sync
 	go c.syncOpenOrders()
-	
+
 	// Read messages
 	go c.readMessages(ctx)
-	
+
+	// Start periodic checksum validation
+	go c.startChecksumValidation(ctx)
+
 	return nil
 }
 
@@ -384,4 +392,148 @@ type HLOrder struct {
 	Size    float64 `json:"sz,string"`
 	OID     int64   `json:"oid"`
 	Status  string  `json:"status"`
+}
+
+// startChecksumValidation runs periodic checksum validation every 30 seconds
+func (c *Client) startChecksumValidation(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Run immediately on start
+	c.validateChecksum()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.validateChecksum()
+		}
+	}
+}
+
+// validateChecksum compares HL and Binance order states
+func (c *Client) validateChecksum() {
+	// Get HL orders
+	hlOrders, err := c.fetchHLOrders()
+	if err != nil {
+		logger.Error("Checksum: failed to fetch HL orders", err)
+		return
+	}
+
+	// Calculate HL checksum (only BTC orders)
+	hlChecksum := c.calculateOrdersChecksum(hlOrders)
+
+	// Get Binance open orders
+	binanceOrders, err := c.binanceClient.GetOpenOrders("BTCUSDT")
+	if err != nil {
+		logger.Error("Checksum: failed to fetch Binance orders", err)
+		return
+	}
+
+	// Calculate Binance checksum
+	binanceChecksum := c.calculateBinanceOrdersChecksum(binanceOrders)
+
+	// Compare checksums
+	c.checksumMutex.RLock()
+	lastChecksum := c.lastChecksum
+	c.checksumMutex.RUnlock()
+
+	if hlChecksum != binanceChecksum {
+		logger.Warn("Checksum mismatch detected, triggering sync",
+			"hl_checksum", hlChecksum,
+			"binance_checksum", binanceChecksum,
+			"hl_count", len(hlOrders),
+			"binance_count", len(binanceOrders),
+		)
+		c.syncOpenOrders()
+	} else if hlChecksum != lastChecksum {
+		logger.Info("Checksum validated (state changed)",
+			"checksum", hlChecksum,
+			"hl_count", len(hlOrders),
+			"binance_count", len(binanceOrders),
+		)
+	}
+
+	c.checksumMutex.Lock()
+	c.lastChecksum = hlChecksum
+	c.checksumMutex.Unlock()
+}
+
+// fetchHLOrders fetches open orders from Hyperliquid
+func (c *Client) fetchHLOrders() ([]HLOrder, error) {
+	url := "https://api.hyperliquid.xyz/info"
+	payload := map[string]interface{}{
+		"type": "openOrders",
+		"user": c.cfg.HyperliquidUser,
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var orders []HLOrder
+	if err := json.NewDecoder(resp.Body).Decode(&orders); err != nil {
+		return nil, err
+	}
+
+	return orders, nil
+}
+
+// calculateOrdersChecksum calculates SHA256 hash of HL orders
+func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
+	// Filter BTC orders only
+	var btcOrders []HLOrder
+	for _, order := range orders {
+		if order.Coin == "BTC" {
+			btcOrders = append(btcOrders, order)
+		}
+	}
+
+	// Sort by OID for consistent ordering
+	sort.Slice(btcOrders, func(i, j int) bool {
+		return btcOrders[i].OID < btcOrders[j].OID
+	})
+
+	// Build string representation
+	var data string
+	for _, order := range btcOrders {
+		data += fmt.Sprintf("%d|%s|%s|%f|%f|", order.OID, order.Coin, order.Side, order.LimitPx, order.Size)
+	}
+
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// calculateBinanceOrdersChecksum calculates SHA256 hash of Binance orders
+func (c *Client) calculateBinanceOrdersChecksum(orders []map[string]interface{}) string {
+	// Sort by orderId for consistent ordering
+	sort.Slice(orders, func(i, j int) bool {
+		idI, _ := orders[i]["orderId"].(float64)
+		idJ, _ := orders[j]["orderId"].(float64)
+		return idI < idJ
+	})
+
+	// Build string representation (only LIMIT orders)
+	var data string
+	for _, order := range orders {
+		orderType, _ := order["type"].(string)
+		if orderType != "LIMIT" {
+			continue
+		}
+
+		orderID, _ := order["orderId"].(float64)
+		symbol, _ := order["symbol"].(string)
+		side, _ := order["side"].(string)
+		price, _ := order["price"].(string)
+		qty, _ := order["origQty"].(string)
+
+		data += fmt.Sprintf("%d|%s|%s|%s|%s|", int64(orderID), symbol, side, price, qty)
+	}
+
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
 }
