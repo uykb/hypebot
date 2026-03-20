@@ -19,12 +19,14 @@ import (
 
 // Client handles Hyperliquid WebSocket
 type Client struct {
-	cfg           *config.Config
-	binanceClient *binance.Client
-	ws            *websocket.Conn
-	connMutex     sync.RWMutex
-	orderMap      map[string]int64 // HL oid -> Binance orderId
-	mapMutex      sync.RWMutex
+	cfg             *config.Config
+	binanceClient   *binance.Client
+	ws              *websocket.Conn
+	connMutex       sync.RWMutex
+	orderMap        map[string]int64 // HL oid -> Binance orderId
+	mapMutex        sync.RWMutex
+	processingMap   map[string]bool // HL oid -> is processing
+	processingMutex sync.RWMutex
 }
 
 // NewClient creates a new Hyperliquid client
@@ -33,6 +35,7 @@ func NewClient(cfg *config.Config, binanceClient *binance.Client) *Client {
 		cfg:           cfg,
 		binanceClient: binanceClient,
 		orderMap:      make(map[string]int64),
+		processingMap: make(map[string]bool),
 	}
 }
 
@@ -173,46 +176,65 @@ func (c *Client) handleMessage(data []byte) {
 }
 
 func (c *Client) handleNewOrUpdate(order HLOrder) {
+	oidStr := strconv.FormatInt(order.OID, 10)
+
+	// Try to acquire processing lock for this order
+	c.processingMutex.Lock()
+	if c.processingMap[oidStr] {
+		c.processingMutex.Unlock()
+		logger.Info("Order already being processed, skipping", "oid", order.OID)
+		return
+	}
+	c.processingMap[oidStr] = true
+	c.processingMutex.Unlock()
+
+	// Ensure we release the processing lock when done
+	defer func() {
+		c.processingMutex.Lock()
+		delete(c.processingMap, oidStr)
+		c.processingMutex.Unlock()
+	}()
+
 	// Calculate follower quantity
 	qty := order.Size * c.cfg.FollowRatio
 	if qty < c.cfg.MinOrderSize {
 		logger.Warn("Quantity below minimum", "qty", qty, "min", c.cfg.MinOrderSize)
 		return
 	}
-	
+
 	// Round to 3 decimals
 	qty = float64(int(qty*1000)) / 1000
-	
+
 	symbol := binance.GetBinanceSymbol(order.Coin)
 	binanceSide := "BUY"
 	if order.Side == "A" {
 		binanceSide = "SELL"
 	}
-	
+
 	// Check if already mapped
 	c.mapMutex.RLock()
-	existingID, exists := c.orderMap[strconv.FormatInt(order.OID, 10)]
+	existingID, exists := c.orderMap[oidStr]
 	c.mapMutex.RUnlock()
-	
+
 	if exists {
 		// Cancel existing and recreate
 		logger.Info("Updating existing order", "hl_oid", order.OID, "binance_id", existingID)
 		c.binanceClient.CancelOrder(symbol, existingID)
 	}
-	
+
 	result, err := c.binanceClient.CreateLimitOrder(symbol, binanceSide, order.LimitPx, qty)
 	if err != nil {
 		logger.Error("Failed to create order", err, "oid", order.OID)
 		return
 	}
-	
+
 	// Save mapping
 	if result != nil {
 		if orderID, ok := result["orderId"].(float64); ok {
 			c.mapMutex.Lock()
-			c.orderMap[strconv.FormatInt(order.OID, 10)] = int64(orderID)
+			c.orderMap[oidStr] = int64(orderID)
 			c.mapMutex.Unlock()
-			
+
 			logger.Info("✅ Order created",
 				"hl_oid", order.OID,
 				"binance_id", int64(orderID),
@@ -224,49 +246,84 @@ func (c *Client) handleNewOrUpdate(order HLOrder) {
 }
 
 func (c *Client) handleCancel(order HLOrder) {
+	oidStr := strconv.FormatInt(order.OID, 10)
+
+	// Try to acquire processing lock for this order
+	c.processingMutex.Lock()
+	if c.processingMap[oidStr] {
+		c.processingMutex.Unlock()
+		logger.Info("Order being processed, queuing cancel", "oid", order.OID)
+		// Wait a bit and retry
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			c.handleCancel(order)
+		}()
+		return
+	}
+	c.processingMap[oidStr] = true
+	c.processingMutex.Unlock()
+
+	// Ensure we release the processing lock when done
+	defer func() {
+		c.processingMutex.Lock()
+		delete(c.processingMap, oidStr)
+		c.processingMutex.Unlock()
+	}()
+
 	c.mapMutex.RLock()
-	binanceID, exists := c.orderMap[strconv.FormatInt(order.OID, 10)]
+	binanceID, exists := c.orderMap[oidStr]
 	c.mapMutex.RUnlock()
-	
+
 	if !exists {
 		logger.Warn("Cancel: order not mapped", "oid", order.OID)
 		return
 	}
-	
+
 	symbol := binance.GetBinanceSymbol(order.Coin)
 	if err := c.binanceClient.CancelOrder(symbol, binanceID); err != nil {
 		logger.Error("Failed to cancel order", err, "oid", order.OID)
 		return
 	}
-	
+
 	c.mapMutex.Lock()
-	delete(c.orderMap, strconv.FormatInt(order.OID, 10))
+	delete(c.orderMap, oidStr)
 	c.mapMutex.Unlock()
-	
+
 	logger.Info("✅ Order cancelled", "hl_oid", order.OID, "binance_id", binanceID)
 }
 
 func (c *Client) handleFill(order HLOrder) {
+	oidStr := strconv.FormatInt(order.OID, 10)
 	logger.Info("Order filled", "oid", order.OID)
-	
+
 	// Cleanup mapping after delay
 	go func() {
 		time.Sleep(5 * time.Second)
+		// Check if currently processing
+		c.processingMutex.RLock()
+		isProcessing := c.processingMap[oidStr]
+		c.processingMutex.RUnlock()
+
+		if isProcessing {
+			// Wait for processing to complete
+			time.Sleep(100 * time.Millisecond)
+		}
+
 		c.mapMutex.Lock()
-		delete(c.orderMap, strconv.FormatInt(order.OID, 10))
+		delete(c.orderMap, oidStr)
 		c.mapMutex.Unlock()
 	}()
 }
 
 func (c *Client) syncOpenOrders() {
 	logger.Info("Syncing open orders from Hyperliquid...")
-	
+
 	url := "https://api.hyperliquid.xyz/info"
 	payload := map[string]interface{}{
 		"type": "openOrders",
 		"user": c.cfg.HyperliquidUser,
 	}
-	
+
 	jsonData, _ := json.Marshal(payload)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -274,30 +331,32 @@ func (c *Client) syncOpenOrders() {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	var orders []HLOrder
 	if err := json.NewDecoder(resp.Body).Decode(&orders); err != nil {
 		logger.Error("Failed to decode orders", err)
 		return
 	}
-	
+
 	logger.Info("Found open orders", "count", len(orders))
-	
+
 	for _, order := range orders {
 		if order.Coin != "BTC" {
 			continue
 		}
-		
+
 		logger.Info("Syncing order",
 			"oid", order.OID,
 			"side", order.Side,
 			"size", order.Size,
 			"price", order.LimitPx,
 		)
-		
+
+		// Process sequentially with rate limiting to avoid race conditions
 		c.handleNewOrUpdate(order)
+		time.Sleep(100 * time.Millisecond) // Rate limit between orders
 	}
-	
+
 	logger.Info("Order sync complete")
 }
 
