@@ -95,6 +95,7 @@ func (c *Client) Connect(ctx context.Context) error {
 // StartChecksumValidation starts the periodic checksum validation (call once from main)
 func (c *Client) StartChecksumValidation(ctx context.Context) {
 	c.startChecksumValidation(ctx)
+}
 
 func (c *Client) subscribe() error {
 	msg := map[string]interface{}{
