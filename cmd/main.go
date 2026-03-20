@@ -74,11 +74,15 @@ func main() {
 func cleanupBinanceOrders(client *binance.Client) error {
 	symbol := "BTCUSDT"
 
+	logger.Info("Fetching open orders from Binance...", "symbol", symbol)
+
 	// Get all open orders
 	orders, err := client.GetOpenOrders(symbol)
 	if err != nil {
 		return fmt.Errorf("failed to get open orders: %w", err)
 	}
+
+	logger.Info("GetOpenOrders result", "count", len(orders))
 
 	if len(orders) == 0 {
 		logger.Info("No existing orders to cleanup")
@@ -86,6 +90,11 @@ func cleanupBinanceOrders(client *binance.Client) error {
 	}
 
 	logger.Info("Found existing orders to cleanup", "count", len(orders))
+
+	// Log first order for debugging
+	if len(orders) > 0 {
+		logger.Info("First order sample", "order", orders[0])
+	}
 
 	// Cancel each order
 	cancelled := 0

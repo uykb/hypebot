@@ -109,17 +109,31 @@ func (c *Client) GetOpenOrders(symbol string) ([]map[string]interface{}, error) 
 	if symbol != "" {
 		params["symbol"] = symbol
 	}
-	
+
 	resp, err := c.signedRequest("GET", "/fapi/v1/openOrders", params)
 	if err != nil {
+		logger.Error("GetOpenOrders API error", err, "symbol", symbol)
 		return nil, err
 	}
-	
-	orders, ok := resp.([]map[string]interface{})
+
+	// Log raw response for debugging
+	logger.Info("GetOpenOrders raw response", "type", fmt.Sprintf("%T"), resp)
+
+	orders, ok := resp.([]interface{})
 	if !ok {
+		logger.Warn("GetOpenOrders: unexpected response type", "type", fmt.Sprintf("%T"), resp)
 		return []map[string]interface{}{}, nil
 	}
-	return orders, nil
+
+	// Convert []interface{} to []map[string]interface{}
+	result := make([]map[string]interface{}, 0, len(orders))
+	for _, order := range orders {
+		if orderMap, ok := order.(map[string]interface{}); ok {
+			result = append(result, orderMap)
+		}
+	}
+
+	return result, nil
 }
 
 func (c *Client) signedRequest(method, endpoint string, params map[string]string) (interface{}, error) {
