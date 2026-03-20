@@ -35,6 +35,8 @@ type Client struct {
 	checksumMutex   sync.RWMutex
 	reconnecting    bool
 	reconnectMutex  sync.Mutex
+	syncing         bool
+	syncMutex       sync.Mutex
 }
 
 // NewClient creates a new Hyperliquid client
@@ -344,6 +346,21 @@ func (c *Client) handleFill(order HLOrder) {
 }
 
 func (c *Client) syncOpenOrders() {
+	c.syncMutex.Lock()
+	if c.syncing {
+		c.syncMutex.Unlock()
+		logger.Info("Sync already in progress, skipping")
+		return
+	}
+	c.syncing = true
+	c.syncMutex.Unlock()
+
+	defer func() {
+		c.syncMutex.Lock()
+		c.syncing = false
+		c.syncMutex.Unlock()
+	}()
+
 	logger.Info("Starting bidirectional order sync...")
 
 	// Fetch HL orders
@@ -528,10 +545,13 @@ type HLOrder struct {
 
 // startChecksumValidation runs periodic checksum validation every 5 minutes (internal)
 func (c *Client) startChecksumValidation(ctx context.Context) {
+	// Wait 30 seconds before first check to allow initial sync to complete
+	time.Sleep(30 * time.Second)
+
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	// Run immediately on start
+	// Run first check
 	c.validateChecksum()
 
 	for {
@@ -546,6 +566,15 @@ func (c *Client) startChecksumValidation(ctx context.Context) {
 
 // validateChecksum compares HL and Binance order states
 func (c *Client) validateChecksum() {
+	// Skip if sync is already in progress
+	c.syncMutex.Lock()
+	if c.syncing {
+		c.syncMutex.Unlock()
+		logger.Info("Checksum: sync in progress, skipping validation")
+		return
+	}
+	c.syncMutex.Unlock()
+
 	// Get HL orders
 	hlOrders, err := c.fetchHLOrders()
 	if err != nil {
