@@ -649,7 +649,7 @@ func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
 	// Filter BTC orders only
 	var btcOrders []HLOrder
 	for _, order := range orders {
-		if order.Coin == "BTC" {
+		if order.Coin == "BTC" && (order.Status == "open" || order.Status == "triggered") {
 			btcOrders = append(btcOrders, order)
 		}
 	}
@@ -659,10 +659,13 @@ func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
 		return btcOrders[i].OID < btcOrders[j].OID
 	})
 
-	// Build string representation
+	// Build string representation using consistent formatting
+	// Round to 8 decimal places to match Binance precision
 	var data string
 	for _, order := range btcOrders {
-		data += fmt.Sprintf("%d|%s|%s|%f|%f|", order.OID, order.Coin, order.Side, order.LimitPx, order.Size)
+		price := strconv.FormatFloat(order.LimitPx, 'f', 8, 64)
+		size := strconv.FormatFloat(order.Size, 'f', 8, 64)
+		data += fmt.Sprintf("%d|%s|%s|%s|%s|", order.OID, order.Coin, order.Side, price, size)
 	}
 
 	hash := sha256.Sum256([]byte(data))
@@ -671,28 +674,47 @@ func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
 
 // calculateBinanceOrdersChecksum calculates SHA256 hash of Binance orders
 func (c *Client) calculateBinanceOrdersChecksum(orders []map[string]interface{}) string {
-	// Sort by orderId for consistent ordering
-	sort.Slice(orders, func(i, j int) bool {
-		idI, _ := orders[i]["orderId"].(float64)
-		idJ, _ := orders[j]["orderId"].(float64)
-		return idI < idJ
-	})
+	// Filter and collect LIMIT orders
+	type orderKey struct {
+		id    int64
+		side  string
+		price string
+		qty   string
+	}
+	var limitOrders []orderKey
 
-	// Build string representation (only LIMIT orders)
-	var data string
 	for _, order := range orders {
 		orderType, _ := order["type"].(string)
 		if orderType != "LIMIT" {
 			continue
 		}
 
-		orderID, _ := order["orderId"].(float64)
-		symbol, _ := order["symbol"].(string)
+		orderID, ok := order["orderId"].(float64)
+		if !ok {
+			continue
+		}
+
 		side, _ := order["side"].(string)
 		price, _ := order["price"].(string)
 		qty, _ := order["origQty"].(string)
 
-		data += fmt.Sprintf("%d|%s|%s|%s|%s|", int64(orderID), symbol, side, price, qty)
+		limitOrders = append(limitOrders, orderKey{
+			id:    int64(orderID),
+			side:  side,
+			price: price,
+			qty:   qty,
+		})
+	}
+
+	// Sort by ID for consistent ordering
+	sort.Slice(limitOrders, func(i, j int) bool {
+		return limitOrders[i].id < limitOrders[j].id
+	})
+
+	// Build string representation (use BTC as symbol for consistency with HL)
+	var data string
+	for _, order := range limitOrders {
+		data += fmt.Sprintf("%d|BTC|%s|%s|%s|", order.id, order.side, order.price, order.qty)
 	}
 
 	hash := sha256.Sum256([]byte(data))
