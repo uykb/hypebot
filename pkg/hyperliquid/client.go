@@ -646,10 +646,10 @@ func (c *Client) fetchHLOrders() ([]HLOrder, error) {
 
 // calculateOrdersChecksum calculates SHA256 hash of HL orders
 func (c *Client) calculateOrdersChecksum(orders []HLOrder) string {
-	// Filter BTC orders only
+	// Filter BTC orders only (openOrders API returns only open orders)
 	var btcOrders []HLOrder
 	for _, order := range orders {
-		if order.Coin == "BTC" && (order.Status == "open" || order.Status == "triggered") {
+		if order.Coin == "BTC" {
 			btcOrders = append(btcOrders, order)
 		}
 	}
