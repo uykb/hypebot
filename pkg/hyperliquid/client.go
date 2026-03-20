@@ -324,48 +324,118 @@ func (c *Client) handleFill(order HLOrder) {
 }
 
 func (c *Client) syncOpenOrders() {
-	logger.Info("Syncing open orders from Hyperliquid...")
+	logger.Info("Starting bidirectional order sync...")
 
-	url := "https://api.hyperliquid.xyz/info"
-	payload := map[string]interface{}{
-		"type": "openOrders",
-		"user": c.cfg.HyperliquidUser,
-	}
-
-	jsonData, _ := json.Marshal(payload)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	// Fetch HL orders
+	hlOrders, err := c.fetchHLOrders()
 	if err != nil {
-		logger.Error("Failed to fetch open orders", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var orders []HLOrder
-	if err := json.NewDecoder(resp.Body).Decode(&orders); err != nil {
-		logger.Error("Failed to decode orders", err)
+		logger.Error("Failed to fetch HL orders", err)
 		return
 	}
 
-	logger.Info("Found open orders", "count", len(orders))
+	// Filter BTC orders and build map
+	hlOrderMap := make(map[int64]HLOrder)
+	for _, order := range hlOrders {
+		if order.Coin == "BTC" {
+			hlOrderMap[order.OID] = order
+		}
+	}
 
-	for _, order := range orders {
-		if order.Coin != "BTC" {
+	// Fetch Binance open orders
+	binanceOrders, err := c.binanceClient.GetOpenOrders("BTCUSDT")
+	if err != nil {
+		logger.Error("Failed to fetch Binance orders", err)
+		return
+	}
+
+	logger.Info("Orders to sync",
+		"hl_btc_count", len(hlOrderMap),
+		"binance_count", len(binanceOrders),
+	)
+
+	// Track Binance orders that should be cancelled (zombie orders)
+	var zombieOrderIDs []int64
+	activeBinanceIDs := make(map[int64]bool)
+
+	for _, bOrder := range binanceOrders {
+		orderType, _ := bOrder["type"].(string)
+		if orderType != "LIMIT" {
 			continue
 		}
 
-		logger.Info("Syncing order",
-			"oid", order.OID,
-			"side", order.Side,
-			"size", order.Size,
-			"price", order.LimitPx,
-		)
+		orderID, ok := bOrder["orderId"].(float64)
+		if !ok {
+			continue
+		}
 
-		// Process sequentially with rate limiting to avoid race conditions
-		c.handleNewOrUpdate(order)
-		time.Sleep(100 * time.Millisecond) // Rate limit between orders
+		binanceID := int64(orderID)
+		activeBinanceIDs[binanceID] = true
+
+		// Check if this Binance order maps to any HL order
+		found := false
+		c.mapMutex.RLock()
+		for hlOID, mappedBinanceID := range c.orderMap {
+			if mappedBinanceID == binanceID {
+				// Check if HL order still exists
+				hlOIDInt, _ := strconv.ParseInt(hlOID, 10, 64)
+				if _, exists := hlOrderMap[hlOIDInt]; exists {
+					found = true
+				}
+				break
+			}
+		}
+		c.mapMutex.RUnlock()
+
+		if !found {
+			// This is a zombie order (Binance has it but HL doesn't)
+			zombieOrderIDs = append(zombieOrderIDs, binanceID)
+		}
 	}
 
-	logger.Info("Order sync complete")
+	// Cancel zombie orders
+	cancelled := 0
+	for _, orderID := range zombieOrderIDs {
+		logger.Info("Cancelling zombie order", "orderId", orderID)
+		if err := c.binanceClient.CancelOrder("BTCUSDT", orderID); err != nil {
+			logger.Error("Failed to cancel zombie order", err, "orderId", orderID)
+		} else {
+			cancelled++
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Sync HL orders to Binance
+	created := 0
+	for _, hlOrder := range hlOrderMap {
+		// Check if already mapped to an active Binance order
+		oidStr := strconv.FormatInt(hlOrder.OID, 10)
+		c.mapMutex.RLock()
+		existingBinanceID, exists := c.orderMap[oidStr]
+		c.mapMutex.RUnlock()
+
+		if exists && activeBinanceIDs[existingBinanceID] {
+			// Order already synced and active, skip
+			continue
+		}
+
+		// Need to create this order
+		logger.Info("Syncing order",
+			"oid", hlOrder.OID,
+			"side", hlOrder.Side,
+			"size", hlOrder.Size,
+			"price", hlOrder.LimitPx,
+		)
+
+		c.handleNewOrUpdate(hlOrder)
+		created++
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	logger.Info("Order sync complete",
+		"zombies_found", len(zombieOrderIDs),
+		"zombies_cancelled", cancelled,
+		"hl_orders_created", created,
+	)
 }
 
 func (c *Client) reconnect() {
