@@ -58,6 +58,9 @@ func main() {
 		}
 	}()
 
+	// Start periodic checksum validation
+	go hlClient.StartChecksumValidation(ctx)
+
 	// Wait for interrupt
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

@@ -26,12 +26,15 @@ type Client struct {
 	binanceClient   *binance.Client
 	ws              *websocket.Conn
 	connMutex       sync.RWMutex
+	writeMutex      sync.Mutex // Protect WebSocket writes
 	orderMap        map[string]int64 // HL oid -> Binance orderId
 	mapMutex        sync.RWMutex
 	processingMap   map[string]bool  // HL oid -> is processing
 	processingMutex sync.RWMutex
 	lastChecksum    string
 	checksumMutex   sync.RWMutex
+	reconnecting    bool
+	reconnectMutex  sync.Mutex
 }
 
 // NewClient creates a new Hyperliquid client
@@ -47,40 +50,51 @@ func NewClient(cfg *config.Config, binanceClient *binance.Client) *Client {
 // Connect connects to Hyperliquid WebSocket
 func (c *Client) Connect(ctx context.Context) error {
 	wsURL := c.cfg.HyperliquidWSURL
-	
+
 	logger.Info("Connecting to Hyperliquid", "url", wsURL)
-	
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
-	
+
 	ws, _, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
-	
+
 	c.connMutex.Lock()
+	oldWS := c.ws
 	c.ws = ws
 	c.connMutex.Unlock()
-	
+
+	// Close old connection if exists
+	if oldWS != nil {
+		oldWS.Close()
+	}
+
 	logger.Info("✅ WebSocket connected")
-	
+
 	// Subscribe to order updates
 	if err := c.subscribe(); err != nil {
+		c.connMutex.Lock()
+		c.ws = nil
+		c.connMutex.Unlock()
+		ws.Close()
 		return err
 	}
-	
+
 	// Initial sync
 	go c.syncOpenOrders()
 
 	// Read messages
 	go c.readMessages(ctx)
 
-	// Start periodic checksum validation
-	go c.startChecksumValidation(ctx)
-
 	return nil
 }
+
+// StartChecksumValidation starts the periodic checksum validation (call once from main)
+func (c *Client) StartChecksumValidation(ctx context.Context) {
+	c.startChecksumValidation(ctx)
 
 func (c *Client) subscribe() error {
 	msg := map[string]interface{}{
@@ -90,11 +104,14 @@ func (c *Client) subscribe() error {
 			"user": c.cfg.HyperliquidUser,
 		},
 	}
-	
+
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+
 	if err := c.ws.WriteJSON(msg); err != nil {
 		return fmt.Errorf("subscribe failed: %w", err)
 	}
-	
+
 	logger.Info("Subscribed to order updates", "user", c.cfg.HyperliquidUser)
 	return nil
 }
@@ -102,37 +119,39 @@ func (c *Client) subscribe() error {
 func (c *Client) readMessages(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			// Send ping
+			c.writeMutex.Lock()
 			c.connMutex.RLock()
 			ws := c.ws
 			c.connMutex.RUnlock()
-			
+
 			if ws != nil {
 				ws.WriteJSON(map[string]string{"method": "ping"})
 			}
+			c.writeMutex.Unlock()
 		default:
 			c.connMutex.RLock()
 			ws := c.ws
 			c.connMutex.RUnlock()
-			
+
 			if ws == nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			
+
 			_, message, err := ws.ReadMessage()
 			if err != nil {
 				logger.Error("WebSocket read error", err)
-				c.reconnect()
-				continue
+				c.reconnect(ctx)
+				return
 			}
-			
+
 			c.handleMessage(message)
 		}
 	}
@@ -438,11 +457,53 @@ func (c *Client) syncOpenOrders() {
 	)
 }
 
-func (c *Client) reconnect() {
+func (c *Client) reconnect(ctx context.Context) {
+	c.reconnectMutex.Lock()
+	if c.reconnecting {
+		c.reconnectMutex.Unlock()
+		logger.Info("Reconnect already in progress, skipping")
+		return
+	}
+	c.reconnecting = true
+	c.reconnectMutex.Unlock()
+
+	defer func() {
+		c.reconnectMutex.Lock()
+		c.reconnecting = false
+		c.reconnectMutex.Unlock()
+	}()
+
 	logger.Info("Reconnecting...")
-	time.Sleep(5 * time.Second)
-	ctx := context.Background()
-	c.Connect(ctx)
+
+	// Close old connection
+	c.connMutex.Lock()
+	if c.ws != nil {
+		c.ws.Close()
+		c.ws = nil
+	}
+	c.connMutex.Unlock()
+
+	// Exponential backoff
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			if err := c.Connect(ctx); err != nil {
+				logger.Error("Reconnect failed", err, "backoff", backoff)
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+			logger.Info("✅ Reconnected successfully")
+			return
+		}
+	}
 }
 
 // Close closes the connection
@@ -464,7 +525,7 @@ type HLOrder struct {
 	Status  string  `json:"status"`
 }
 
-// startChecksumValidation runs periodic checksum validation every 5 minutes
+// startChecksumValidation runs periodic checksum validation every 5 minutes (internal)
 func (c *Client) startChecksumValidation(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
