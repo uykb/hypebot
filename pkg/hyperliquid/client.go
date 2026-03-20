@@ -464,9 +464,9 @@ type HLOrder struct {
 	Status  string  `json:"status"`
 }
 
-// startChecksumValidation runs periodic checksum validation every 30 seconds
+// startChecksumValidation runs periodic checksum validation every 5 minutes
 func (c *Client) startChecksumValidation(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	// Run immediately on start
